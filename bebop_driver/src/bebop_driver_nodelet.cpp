@@ -28,19 +28,31 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSI
 #include <nav_msgs/Odometry.h>
 #include <sensor_msgs/JointState.h>
 #include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
+
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <sensor_msgs/NavSatFix.h>
+#include <sensor_msgs/Imu.h>
 
 #include <boost/bind.hpp>
 #include <boost/make_shared.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
+#include <boost/qvm/mat.hpp>
+#include <boost/qvm/vec.hpp>
+#include <boost/qvm/vec_access.hpp>
+#include <boost/qvm/vec_mat_operations.hpp>
 #include <cmath>
 #include <algorithm>
 #include <string>
 #include <cstdio>
+#include <stdio.h>
+#include <inttypes.h>
+
+
 
 #include <bebop_driver/bebop_driver_nodelet.h>
+#include "bebop_driver/bebop_video_decoder.h"
 #include <bebop_driver/BebopArdrone3Config.h>
 
 // For AuxThread() - without the following, callback wrapper types are incomplete to the compiler
@@ -94,9 +106,14 @@ void BebopDriverNodelet::onInit()
   const std::string& param_bebop_ip = private_nh.param<std::string>("bebop_ip", "192.168.42.1");
 
   param_camera_frame_id_ = private_nh.param<std::string>("camera_frame_id", "camera_optical");
-  param_odom_frame_id_ = private_nh.param<std::string>("odom_frame_id", "odom");
+  param_odom_frame_id_ = private_nh.param<std::string>("odom_frame_id", "odom_old");
+  param_global_odom_frame_id_ = private_nh.param<std::string>("global_odom_frame_id", "odom");
+
   param_publish_odom_tf_ = private_nh.param<bool>("publish_odom_tf", true);
+  param_publish_global_odom_tf_ = private_nh.param<bool>("publish_global_odom_tf", true);
+
   param_cmd_vel_timeout_ = private_nh.param<double>("cmd_vel_timeout", 0.2);
+
 
   NODELET_INFO("Connecting to Bebop ...");
   try
@@ -147,7 +164,11 @@ void BebopDriverNodelet::onInit()
   exposure_sub_ = nh.subscribe("set_exposure", 10, &BebopDriverNodelet::SetExposureCallback, this);
   toggle_recording_sub_ = nh.subscribe("record", 10, &BebopDriverNodelet::ToggleRecordingCallback, this);
 
-  odom_pub_ = nh.advertise<nav_msgs::Odometry>("odom", 30);
+  odom_pub_ = nh.advertise<nav_msgs::Odometry>("odom_old", 30);
+  global_odom_pub_ = nh.advertise<nav_msgs::Odometry>("odom", 30);
+  velocities_pub_ = nh.advertise<geometry_msgs::Vector3>("velocities", 10, true);
+  imu_pub_ = nh.advertise<sensor_msgs::Imu>("imu", 100);
+
   camera_joint_pub_ = nh.advertise<sensor_msgs::JointState>("joint_states", 10, true);
   gps_fix_pub_ = nh.advertise<sensor_msgs::NavSatFix>("fix", 10, true);
 
@@ -426,11 +447,49 @@ void BebopDriverNodelet::ParamCallback(BebopArdrone3Config &config, uint32_t lev
   bebop_ptr_->UpdateSettings(config);
 }
 
+
+double fixed_point_to_double(int16_t q, int e) {
+   return ((double) ((short) ntohs(q)))/((double) (1<<e));
+}
+double fixed_point_32_to_double(int32_t q, int e) {
+   return ((double) ((short) ntohs(q)))/((double) (1<<e));
+}
+
 // Runs its own context
 void BebopDriverNodelet::CameraPublisherThread()
 {
   uint32_t frame_w = 0;
   uint32_t frame_h = 0;
+
+  // double last_north_speed = 0.0;double last_east_speed = 0.0; double last_down_speed = 0.0;
+  // double beb_last_roll_rad = 0.0;double beb_last_pitch_rad = 0.0; double beb_last_yaw_rad = 0;
+  // tf2::Vector3 global_vel(0.0, 0.0, 0.0);
+  tf2::Vector3 global_last_vel(0.0, 0.0, 0.0); 
+
+  tf2::Vector3 beb_acc(0.0, 0.0, 0.0);
+  tf2::Vector3 beb_vel(0.0, 0.0, 0.0);
+  tf2::Vector3 beb_last_vel(0.0, 0.0, 0.0);
+  // tf2::Vector3 beb_ang(0.0, 0.0, 0.0);
+  tf2::Vector3 beb_last_ang(0.0, 0.0, 0.0);
+  tf2::Vector3 beb_v_ang(0.0, 0.0, 0.0);
+
+  tf2::Vector3 frame_acc(0.0, 0.0, 0.0);
+  tf2::Vector3 frame_vel(0.0, 0.0, 0.0);
+  tf2::Vector3 frame_last_vel(0.0, 0.0, 0.0);
+  // tf2::Vector3 frame_ang(0.0, 0.0, 0.0);
+  tf2::Vector3 frame_last_ang(0.0, 0.0, 0.0);
+  tf2::Vector3 frame_v_ang(0.0, 0.0, 0.0);
+
+  // TF2, Integerator
+  geometry_msgs::TransformStamped global_odom_to_base_tf;
+  global_odom_to_base_tf.header.frame_id = param_global_odom_frame_id_;
+  global_odom_to_base_tf.child_frame_id = "base_link";
+  tf2_ros::TransformBroadcaster tf_broad;
+  tf2::Vector3 global_odom_to_base_trans_v3(0.0, 0.0, 0.0);
+  tf2::Quaternion global_odom_to_base_rot_q;
+
+  ros::Time last_t = ros::Time::now();
+
   NODELET_INFO_STREAM("[CameraThread] thread lwp_id: " << util::GetLWPId());
 
   while (!boost::this_thread::interruption_requested())
@@ -438,11 +497,15 @@ void BebopDriverNodelet::CameraPublisherThread()
     try
     {
       sensor_msgs::ImagePtr image_msg_ptr_(new sensor_msgs::Image());
+      bebop_driver::MetadataV2Base_t meta_data;
+      geometry_msgs::Vector3 beb_vel_msg_;
+      sensor_msgs::Imu imu_msg_;
+      
       const ros::Time t_now = ros::Time::now();
 
       NODELET_DEBUG_STREAM("Grabbing a frame from Bebop");
       // This is blocking
-      bebop_ptr_->GetFrontCameraFrame(image_msg_ptr_->data, frame_w, frame_h);
+      bebop_ptr_->GetFrontCameraFrame(image_msg_ptr_->data, frame_w, frame_h, meta_data);
 
       NODELET_DEBUG_STREAM("Frame grabbed: " << frame_w << " , " << frame_h);
       camera_info_msg_ptr_.reset(new sensor_msgs::CameraInfo(cinfo_manager_ptr_->getCameraInfo()));
@@ -451,6 +514,180 @@ void BebopDriverNodelet::CameraPublisherThread()
       camera_info_msg_ptr_->width = frame_w;
       camera_info_msg_ptr_->height = frame_h;
 
+			// Converting Parrot Q8.8 to normal doubles
+			double north_speed = fixed_point_to_double(meta_data.northSpeed, 8);
+			double east_speed = -fixed_point_to_double(meta_data.eastSpeed, 8);
+			double down_speed = -fixed_point_to_double(meta_data.downSpeed, 8);
+			tf2::Vector3 global_vel(north_speed, east_speed, down_speed);
+
+			double groundDistance = fixed_point_32_to_double(meta_data.groundDistance, 16);
+
+
+			
+      //converts int16_t data into 2 integer bits and 14 decimal bits and stores into a double
+      double beb_qw = fixed_point_to_double(meta_data.droneW,14);
+      double beb_qx = fixed_point_to_double(meta_data.droneX,14);
+      double beb_qy = -fixed_point_to_double(meta_data.droneY,14); //-
+      double beb_qz = -fixed_point_to_double(meta_data.droneZ,14); //-
+      
+      tf2::Quaternion beb_q(beb_qx,beb_qy,beb_qz,beb_qw);
+      tf2::Matrix3x3 beb_m(beb_q);
+      
+      double beb_roll_rad, beb_pitch_rad, beb_yaw_rad;
+      beb_m.getRPY(beb_roll_rad, beb_pitch_rad, beb_yaw_rad);      
+      tf2::Vector3 beb_ang(beb_roll_rad, beb_pitch_rad, beb_yaw_rad);
+
+      beb_vel = beb_m * global_vel;
+
+
+      double frame_qw = fixed_point_to_double(meta_data.frameW,14);
+      double frame_qx = fixed_point_to_double(meta_data.frameX,14);
+      double frame_qy = -fixed_point_to_double(meta_data.frameY,14); //-
+      double frame_qz = -fixed_point_to_double(meta_data.frameZ,14); //-
+
+
+      tf2::Quaternion frame_q(frame_qx,frame_qy,frame_qz,frame_qw);
+      tf2::Matrix3x3 frame_m(frame_q);
+
+      double frame_roll_rad, frame_pitch_rad, frame_yaw_rad;
+      frame_m.getRPY(frame_roll_rad, frame_pitch_rad, frame_yaw_rad);      
+      tf2::Vector3 frame_ang(frame_roll_rad, frame_pitch_rad, frame_yaw_rad);
+
+      frame_vel = frame_m * global_vel;
+
+      tf2::Vector3 default_g(0, 0, 9.8);
+
+      // double norm = sqrt(qw*qw+qx*qx+qy*qy+qz*qz);
+
+
+      // ROS_INFO("%d\n", north_speed);
+      // printf ("north_speed  %f ,east_speed %f ,down_speed %f  \n", north_speed,east_speed ,down_speed);
+      
+      // printf ("qw %f  ,qx  %f ,qy  %f ,qz %f  \n", qw,qx,qy,qz);
+      // printf ("qw %f  ,qx  %f ,qy  %f ,qz %f  \n", qw,qx,qy,qz);
+      // printf ("norm %f \n", norm);
+
+
+      // std::cout << meta_data.droneW << " , "<< meta_data.droneX << " , "<< meta_data.droneY << " , "<< meta_data.droneZ<< std::endl;
+      // std::cout << std::bitset<16>(meta_data.droneW) << " , "<< std::bitset<16>(meta_data.droneX) << " , "<< std::bitset<16>(meta_data.droneY) << " , "<< std::bitset<16>(meta_data.droneZ)<< std::endl;
+      
+
+      // std::cout << "roll: "<< beb_roll_rad << ", pitch: " << beb_pitch_rad << ", yaw: " << beb_yaw_rad<< std::endl;
+
+			// Transform velocities from north, east, down to x, y, z
+
+      // beb_v_roll_rad = (beb_roll_rad - beb_last_roll_rad)/dt;
+      // beb_v_pitch_rad = (beb_pitch_rad - beb_last_pitch_rad)/dt;
+      // beb_v_yaw_rad = (beb_yaw_rad - beb_last_yaw_rad)/dt;
+
+
+      //fake IMU considering the camera orientation 
+      imu_msg_.header.stamp = t_now;
+      imu_msg_.header.frame_id = "imu4";
+      // imu_msg_.orientation.x = frame_qx;
+      // imu_msg_.orientation.y = frame_qy;
+      // imu_msg_.orientation.z = frame_qz;
+      // imu_msg_.orientation.w = frame_qw;
+
+
+      const double dt = fabs((t_now - last_t).toSec());
+
+      if(dt>1e-6 && dt < 0.2 ) {
+
+        beb_acc = (beb_vel-beb_last_vel)/dt + beb_m * default_g;
+        frame_acc = (frame_vel-frame_last_vel)/dt + frame_m * default_g;
+
+        beb_v_ang = (beb_ang - beb_last_ang)/dt;
+        frame_v_ang = (frame_ang - frame_last_ang)/dt;
+
+        imu_msg_.linear_acceleration.x = frame_acc[0];
+        imu_msg_.linear_acceleration.y = frame_acc[1];
+        imu_msg_.linear_acceleration.z = frame_acc[2];
+
+        // imu_msg_.linear_acceleration.x = (north_speed-last_north_speed)/dt;
+        // imu_msg_.linear_acceleration.y = (east_speed-last_east_speed)/dt;
+        // imu_msg_.linear_acceleration.z = (down_speed-last_down_speed)/dt;
+
+        imu_msg_.angular_velocity.x = frame_v_ang[0];
+        imu_msg_.angular_velocity.y = frame_v_ang[1];
+        imu_msg_.angular_velocity.z = frame_v_ang[2];
+
+        // imu_msg_.orientation_covariance = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        // imu_msg_.orientation_covariance = {99999.9, 0.0, 0.0, 0.0, 99999.9, 0.0, 0.0, 0.0, 99999.9};
+
+        imu_msg_.angular_velocity_covariance = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+
+        const double min_speed = 1E-9;
+        if (fabs(down_speed) < min_speed && fabs(north_speed) < min_speed && fabs(east_speed) < min_speed){
+          imu_msg_.linear_acceleration_covariance = {99999.9, 0.0, 0.0, 0.0, 99999.9, 0.0, 0.0, 0.0, 99999.9};
+        }else{
+          imu_msg_.linear_acceleration_covariance = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        }
+        
+      } else {
+        imu_msg_.angular_velocity_covariance = {99999.9, 0.0, 0.0, 0.0, 99999.9, 0.0, 0.0, 0.0, 99999.9};
+        imu_msg_.linear_acceleration_covariance = {99999.9, 0.0, 0.0, 0.0, 99999.9, 0.0, 0.0, 0.0, 99999.9};
+      }
+      //update last values
+      // last_north_speed = north_speed;
+      // last_east_speed = east_speed;
+      // last_down_speed = down_speed;
+
+      // beb_last_roll_rad = beb_roll_rad;
+      // beb_last_pitch_rad = beb_pitch_rad;
+      // beb_last_yaw_rad = beb_yaw_rad;
+      
+      // last_velocity = velocity;
+
+      beb_last_vel = beb_vel;
+      frame_last_vel = frame_vel;
+      beb_last_ang = beb_ang;
+      frame_last_ang = frame_ang;
+      last_t = t_now;
+
+      
+      // ros::Time stamp = std::max(speed_esd_ptr->header.stamp, attitude_ptr->header.stamp);
+
+      // const double beb_vx_enu = speed_esd_ptr->speedX;
+      // const double beb_vy_enu = -speed_esd_ptr->speedY;
+      // const double beb_vz_enu = -speed_esd_ptr->speedZ;
+      // beb_vx_m = cos(beb_yaw_rad) * beb_vx_enu + sin(beb_yaw_rad) * beb_vy_enu;
+      // beb_vy_m = -sin(beb_yaw_rad) * beb_vx_enu + cos(beb_yaw_rad) * beb_vy_enu;
+      // beb_vz_m = beb_vz_enu;
+
+      global_odom_to_base_trans_v3 += tf2::Vector3(north_speed * dt, east_speed * dt, down_speed * dt);
+
+      nav_msgs::OdometryPtr global_odom_msg_ptr(new nav_msgs::Odometry());
+      global_odom_msg_ptr->header.stamp = t_now;
+      global_odom_msg_ptr->header.frame_id = param_global_odom_frame_id_;
+      global_odom_msg_ptr->child_frame_id = "base_link";
+      global_odom_msg_ptr->twist.twist.linear.x = north_speed;
+      global_odom_msg_ptr->twist.twist.linear.y = east_speed;
+      global_odom_msg_ptr->twist.twist.linear.z = down_speed;
+      
+      global_odom_msg_ptr->twist.twist.angular.x = beb_v_ang[0];
+      global_odom_msg_ptr->twist.twist.angular.y = beb_v_ang[1];
+      global_odom_msg_ptr->twist.twist.angular.z = beb_v_ang[2];
+
+      global_odom_msg_ptr->pose.pose.position.x = global_odom_to_base_trans_v3.x();
+      global_odom_msg_ptr->pose.pose.position.y = global_odom_to_base_trans_v3.y();
+      global_odom_msg_ptr->pose.pose.position.z = global_odom_to_base_trans_v3.z();
+      // global_odom_msg_ptr->pose.pose.orientation = imu_msg_.orientation;
+      tf2::convert(beb_q, global_odom_msg_ptr->pose.pose.orientation);
+
+      global_odom_pub_.publish(global_odom_msg_ptr);
+
+      // printf("global_ODOM qw %f  ,qx  %f ,qy  %f ,qz %f  \n", global_odom_msg_ptr->pose.pose.orientation.w, global_odom_msg_ptr->pose.pose.orientation.x,global_odom_msg_ptr->pose.pose.orientation.y,global_odom_msg_ptr->pose.pose.orientation.z);
+
+      
+      if (param_publish_global_odom_tf_)
+      {
+        global_odom_to_base_tf.header.stamp = t_now;
+        tf2::convert(tf2::Transform(beb_q, global_odom_to_base_trans_v3), global_odom_to_base_tf.transform);
+        tf_broad.sendTransform(global_odom_to_base_tf);
+      }
+
+      //publish messages
       if (image_transport_pub_.getNumSubscribers() > 0)
       {
         image_msg_ptr_->encoding = "rgb8";
@@ -462,6 +699,18 @@ void BebopDriverNodelet::CameraPublisherThread()
         image_msg_ptr_->step = image_msg_ptr_->width * 3;
 
         image_transport_pub_.publish(image_msg_ptr_, camera_info_msg_ptr_);
+      }
+
+      if (velocities_pub_.getNumSubscribers() > 0)
+      {
+        beb_vel_msg_.x = beb_vel[0];
+        beb_vel_msg_.y = beb_vel[1];
+        beb_vel_msg_.z = beb_vel[2];
+        velocities_pub_.publish(beb_vel_msg_);
+      }
+      if (imu_pub_.getNumSubscribers() > 0)
+      {
+        imu_pub_.publish(imu_msg_);
       }
     }
     catch (const std::runtime_error& e)
@@ -494,9 +743,18 @@ void BebopDriverNodelet::AuxThread()
   bebop_msgs::Ardrone3PilotingStatePositionChanged::ConstPtr gps_state_ptr;
 
   // REP-103
+  double beb_last_roll_rad = 0.0;
+  double beb_last_pitch_rad = 0.0;
+  double beb_last_yaw_rad = 0.0;
+  
   double beb_roll_rad = 0.0;
   double beb_pitch_rad = 0.0;
   double beb_yaw_rad = 0.0;
+
+  double beb_v_roll_rad = 0.0;
+  double beb_v_pitch_rad = 0.0;
+  double beb_v_yaw_rad = 0.0;
+
   double beb_vx_m = 0.0;
   double beb_vy_m = 0.0;
   double beb_vz_m = 0.0;
@@ -599,9 +857,18 @@ void BebopDriverNodelet::AuxThread()
         if ((attitude_ptr->header.stamp - last_att_time).toSec() > util::eps)
         {
           last_att_time = attitude_ptr->header.stamp;
+
+          beb_last_roll_rad = beb_roll_rad;
+          beb_last_pitch_rad = beb_pitch_rad;
+          beb_last_yaw_rad = beb_yaw_rad;
+
           beb_roll_rad = attitude_ptr->roll;
           beb_pitch_rad = -attitude_ptr->pitch;
           beb_yaw_rad = -attitude_ptr->yaw;
+
+          beb_v_roll_rad = beb_roll_rad - beb_last_roll_rad;
+          beb_v_pitch_rad = beb_pitch_rad - beb_last_pitch_rad;
+          beb_v_yaw_rad = beb_yaw_rad - beb_last_yaw_rad;
 
           odom_to_base_rot_q.setRPY(beb_roll_rad, beb_pitch_rad, beb_yaw_rad);
           new_attitude_data = true;
@@ -633,6 +900,10 @@ void BebopDriverNodelet::AuxThread()
         odom_msg_ptr->twist.twist.linear.x = beb_vx_m;
         odom_msg_ptr->twist.twist.linear.y = beb_vy_m;
         odom_msg_ptr->twist.twist.linear.z = beb_vz_m;
+        
+        odom_msg_ptr->twist.twist.angular.x = beb_v_roll_rad;
+        odom_msg_ptr->twist.twist.angular.y = beb_v_pitch_rad;
+        odom_msg_ptr->twist.twist.angular.z = beb_v_yaw_rad;
 
         // TODO(mani-monaj): Optimize this
         odom_msg_ptr->pose.pose.position.x = odom_to_base_trans_v3.x();
@@ -640,6 +911,8 @@ void BebopDriverNodelet::AuxThread()
         odom_msg_ptr->pose.pose.position.z = odom_to_base_trans_v3.z();
         tf2::convert(odom_to_base_rot_q, odom_msg_ptr->pose.pose.orientation);
         odom_pub_.publish(odom_msg_ptr);
+
+        // printf("ODOM qw %f  ,qx  %f ,qy  %f ,qz %f  \n", odom_msg_ptr->pose.pose.orientation.w, odom_msg_ptr->pose.pose.orientation.x,odom_msg_ptr->pose.pose.orientation.y,odom_msg_ptr->pose.pose.orientation.z);
 
         if (param_publish_odom_tf_)
         {

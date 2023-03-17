@@ -38,6 +38,7 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSI
 #include <std_msgs/Bool.h>
 #include <std_msgs/String.h>
 #include <camera_info_manager/camera_info_manager.h>
+#include <geometry_msgs/Vector3.h>
 #include <image_transport/image_transport.h>
 #include <dynamic_reconfigure/server.h>
 
@@ -126,8 +127,12 @@ private:
   ros::Subscriber toggle_recording_sub_;
 
   ros::Publisher odom_pub_;
+  ros::Publisher global_odom_pub_;
   ros::Publisher camera_joint_pub_;
   ros::Publisher gps_fix_pub_;
+  ros::Publisher velocities_pub_;
+  ros::Publisher imu_pub_;
+
 
   boost::shared_ptr<camera_info_manager::CameraInfoManager> cinfo_manager_ptr_;
   boost::shared_ptr<image_transport::ImageTransport> image_transport_ptr_;
@@ -141,7 +146,11 @@ private:
   // Params (not dynamically reconfigurable, persistent)
   std::string param_camera_frame_id_;
   std::string param_odom_frame_id_;
+  std::string param_global_odom_frame_id_;
+
   bool param_publish_odom_tf_;
+  bool param_publish_global_odom_tf_;
+  
   double param_cmd_vel_timeout_;
 
   // This runs in its own context
