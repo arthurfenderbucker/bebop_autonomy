@@ -516,10 +516,46 @@ void Bebop::AnimationFlip(const uint8_t &anim_id)
         "Navigate home failed");
 }
 
+void Bebop::setMaxSpeed(const double &max_h, const double &max_v, const double &max_ang)
+{
+    ThrowOnInternalError("set max horizontal speed failed");
+    ThrowOnCtrlError(device_controller_ptr_->aRDrone3
+                         ->sendPilotingSettingsSetAutonomousFlightMaxHorizontalSpeed(device_controller_ptr_->aRDrone3, max_h),
+                     "set max horizontal speed failed");
+
+    ThrowOnInternalError("set max vertical speed failed");
+    ThrowOnCtrlError(device_controller_ptr_->aRDrone3
+                         ->sendPilotingSettingsSetAutonomousFlightMaxVerticalSpeed(device_controller_ptr_->aRDrone3, max_v),
+                     "set max vertical speed failed");
+
+    ThrowOnInternalError("set max rotation speed failed");
+    ThrowOnCtrlError(device_controller_ptr_->aRDrone3
+                        ->sendPilotingSettingsSetAutonomousFlightMaxRotationSpeed(device_controller_ptr_->aRDrone3, max_ang),
+                    "set max rotation speed failed");
+}
+
+void Bebop::MoveBy(const double &dx, const double &dy, const double &dz, const double &dpsi)
+{
+    ThrowOnInternalError("Move By failed");
+    ThrowOnCtrlError(device_controller_ptr_->aRDrone3
+                         ->sendPilotingMoveBy(device_controller_ptr_->aRDrone3, dx, dy, dz, dpsi),
+                     "Move By failed");
+}
+
+
+void Bebop::YawCmd(const float &yaw)
+{
+  ThrowOnInternalError("Move By failed");
+  ThrowOnCtrlError(
+    device_controller_ptr_->aRDrone3->setPilotingPCMDYaw(device_controller_ptr_->aRDrone3, static_cast<int8_t>(yaw * 100.0)),"Move By failed");
+}
+
+
 void Bebop::Move(const double &roll, const double &pitch, const double &gaz_speed, const double &yaw_speed)
 {
   // TODO(mani-monaj): Bound check
   ThrowOnInternalError("Move failure");
+
 
   // If roll or pitch value are non-zero, enabel roll/pitch flag
   const bool do_rp = !((fabs(roll) < 0.001) && (fabs(pitch) < 0.001));
@@ -546,6 +582,7 @@ void Bebop::Move(const double &roll, const double &pitch, const double &gaz_spee
             static_cast<int8_t>(yaw_speed * 100.0),
             static_cast<int8_t>(gaz_speed * 100.0),
             0));
+    
   }
 }
 

@@ -106,12 +106,15 @@ private:
 
   geometry_msgs::Twist prev_bebop_twist_;
   ros::Time prev_twist_stamp_;
+  ros::Time prev_moveby_stamp_;
+
   boost::mutex twist_mutex_;
 
   geometry_msgs::Twist camera_twist_;
   geometry_msgs::Twist prev_camera_twist_;
 
   ros::Subscriber cmd_vel_sub_;
+  ros::Subscriber moveby_sub_;
   ros::Subscriber camera_move_sub_;
   ros::Subscriber takeoff_sub_;
   ros::Subscriber land_sub_;
@@ -152,6 +155,7 @@ private:
   bool param_publish_global_odom_tf_;
   
   double param_cmd_vel_timeout_;
+  double param_moveby_timeout_;
 
   // This runs in its own context
   void CameraPublisherThread();
@@ -159,6 +163,7 @@ private:
   // Safety monitor + ROS specfic publishers (TF, Odom, etc)
   void AuxThread();
 
+  void MoveByCallBack(const geometry_msgs::TwistConstPtr &twist_ptr);
   void CmdVelCallback(const geometry_msgs::TwistConstPtr& twist_ptr);
   void CameraMoveCallback(const geometry_msgs::TwistConstPtr& twist_ptr);
   void TakeoffCallback(const std_msgs::EmptyConstPtr& empty_ptr);

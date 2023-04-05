@@ -96,6 +96,7 @@ void BebopDriverNodelet::onInit()
     util::ResetTwist(prev_bebop_twist_);
     util::ResetTwist(prev_camera_twist_);
     prev_twist_stamp_ = ros::Time(0);
+    prev_moveby_stamp_ = ros::Time(0);
   }
 
   // Params (not dynamically reconfigurable, local)
@@ -113,6 +114,7 @@ void BebopDriverNodelet::onInit()
   param_publish_global_odom_tf_ = private_nh.param<bool>("publish_global_odom_tf", true);
 
   param_cmd_vel_timeout_ = private_nh.param<double>("cmd_vel_timeout", 0.2);
+  param_moveby_timeout_ = private_nh.param<double>("moveby_timeout", 10.0);
 
 
   NODELET_INFO("Connecting to Bebop ...");
@@ -150,6 +152,8 @@ void BebopDriverNodelet::onInit()
   }
 
   cmd_vel_sub_ = nh.subscribe("cmd_vel", 1, &BebopDriverNodelet::CmdVelCallback, this);
+  moveby_sub_ = nh.subscribe("moveby", 1, &BebopDriverNodelet::MoveByCallBack, this);
+
   camera_move_sub_ = nh.subscribe("camera_control", 1, &BebopDriverNodelet::CameraMoveCallback, this);
   takeoff_sub_ = nh.subscribe("takeoff", 1, &BebopDriverNodelet::TakeoffCallback, this);
   land_sub_ = nh.subscribe("land", 1, &BebopDriverNodelet::LandCallback, this);
@@ -204,6 +208,8 @@ void BebopDriverNodelet::onInit()
         boost::bind(&bebop_driver::BebopDriverNodelet::BebopDriverNodelet::AuxThread, this));
 
   NODELET_INFO_STREAM("Nodelet lwp_id: " << util::GetLWPId());
+
+  bebop_ptr_->setMaxSpeed(0.5,0.5,10);
 }
 
 BebopDriverNodelet::~BebopDriverNodelet()
@@ -225,6 +231,30 @@ BebopDriverNodelet::~BebopDriverNodelet()
   if (bebop_ptr_->IsConnected()) bebop_ptr_->Disconnect();
 }
 
+
+void BebopDriverNodelet::MoveByCallBack(const geometry_msgs::TwistConstPtr &twist_ptr)
+{
+    
+    NODELET_INFO_STREAM("Moveby callback");
+    std::cout << "Moveby callback" << std::endl;
+    prev_moveby_stamp_ = ros::Time::now();
+    ros::Rate(ros::Duration(1.0)).sleep();
+
+    try {
+        const double dx = twist_ptr->linear.x;    //displacement along the front axis
+        const double dy = twist_ptr->linear.y;    //displacement along the right axis
+        const double dz = twist_ptr->linear.z;    //displacement along the down axis
+        const double dpsi = twist_ptr->angular.z; // rotation of heading
+        bebop_ptr_->MoveBy(dx, dy, dz, dpsi);
+    } catch (const std::runtime_error &e) {
+        ROS_ERROR_STREAM("[MoveBy] " << e.what());
+    }
+    NODELET_INFO_STREAM("Moveby DONE");
+
+    // param_cmd_vel_timeout_ = old_param_cmd_vel_timeout_;
+
+}
+
 void BebopDriverNodelet::CmdVelCallback(const geometry_msgs::TwistConstPtr& twist_ptr)
 {
   try
@@ -241,10 +271,19 @@ void BebopDriverNodelet::CmdVelCallback(const geometry_msgs::TwistConstPtr& twis
     // TODO: Always apply zero after non-zero values
     if (is_bebop_twist_changed)
     {
-      bebop_ptr_->Move(CLAMP(-bebop_twist_.linear.y, -1.0, 1.0),
-                       CLAMP(bebop_twist_.linear.x, -1.0, 1.0),
-                       CLAMP(bebop_twist_.linear.z, -1.0, 1.0),
-                       CLAMP(-bebop_twist_.angular.z, -1.0, 1.0));
+      
+      const double roll = CLAMP(-bebop_twist_.linear.y, -1.0, 1.0);
+      const double pitch = CLAMP(bebop_twist_.linear.x, -1.0, 1.0);
+      const double gaz_speed = CLAMP(bebop_twist_.linear.z, -1.0, 1.0);
+      const double yaw_speed = CLAMP(-bebop_twist_.angular.z, -1.0, 1.0);
+
+      const bool yaw_only = ((fabs(roll) < 0.0001) && (fabs(pitch) < 0.0001) && (fabs(gaz_speed) < 0.0001) && (fabs(yaw_speed) > 0.0001));
+
+      if (yaw_only){
+        bebop_ptr_->YawCmd(yaw_speed);
+      }else{
+        bebop_ptr_->Move(roll,pitch,gaz_speed, yaw_speed);
+      }
     }
   }
   catch (const std::runtime_error& e)
@@ -273,7 +312,7 @@ void BebopDriverNodelet::LandCallback(const std_msgs::EmptyConstPtr& empty_ptr)
   }
   catch (const std::runtime_error& e)
   {
-    ROS_ERROR_STREAM(e.what());
+    // ROS_ERROR_STREAM(e.what());
   }
 }
 
@@ -521,8 +560,12 @@ void BebopDriverNodelet::CameraPublisherThread()
 			tf2::Vector3 global_vel(north_speed, east_speed, down_speed);
 
 			double groundDistance = fixed_point_32_to_double(meta_data.groundDistance, 16);
+      
+			int batteryPercentage = unsigned(meta_data.batteryPercentage);
+      int wifiRssi = (int) meta_data.wifiRssi;
 
-
+      // std::cout << "batteryPercentage " << batteryPercentage <<std::endl;
+      // std::cout << "wifiRssi " << wifiRssi << std::endl;
 			
       //converts int16_t data into 2 integer bits and 14 decimal bits and stores into a double
       double beb_qw = fixed_point_to_double(meta_data.droneW,14);
@@ -792,6 +835,10 @@ void BebopDriverNodelet::AuxThread()
   gps_msg.status.service = sensor_msgs::NavSatStatus::SERVICE_GPS | sensor_msgs::NavSatStatus::SERVICE_GLONASS;
   gps_msg.position_covariance_type = sensor_msgs::NavSatFix::COVARIANCE_TYPE_UNKNOWN;
 
+
+  // double old_param_cmd_vel_timeout_ = param_cmd_vel_timeout_;
+
+
   while (!boost::this_thread::interruption_requested())
   {
     try
@@ -807,9 +854,16 @@ void BebopDriverNodelet::AuxThread()
         boost::unique_lock<boost::mutex> twist_lock(twist_mutex_);
         if ( !util::CompareTwists(prev_bebop_twist_, zero_twist) &&
             ((t_now - prev_twist_stamp_).toSec() > param_cmd_vel_timeout_)
+            // && ((t_now - prev_moveby_stamp_).toSec() > param_moveby_timeout_)
            )
         {
+          std::cout << "moveby time " << (t_now - prev_moveby_stamp_).toSec()  << std::endl;
+          // param_cmd_vel_timeout_ = old_param_cmd_vel_timeout_;
           NODELET_WARN("[AuxThread] Input cmd_vel timeout, reseting cmd_vel ...");
+          // NODELET_WARN(old_param_cmd_vel_timeout_);
+          // NODELET_WARN(param_cmd_vel_timeout_);
+
+
           util::ResetTwist(prev_bebop_twist_);
           bebop_ptr_->Move(0.0, 0.0, 0.0, 0.0);
         }
